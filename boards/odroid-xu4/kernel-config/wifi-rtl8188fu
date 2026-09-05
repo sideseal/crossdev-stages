@@ -1,0 +1,10 @@
+# USB WiFi dongle support: Realtek RTL8188FU (0bda:f179), sold under various
+# OEM labels including "RTL8188FTV 802.11b/g/n 1T1R".  Handled by mainline's
+# rtl8xxxu driver (drivers/net/wireless/realtek/rtl8xxxu/8188f.c), which maps
+# 0xf179 to rtl8188fu_fops directly -- no #ifdef CONFIG_RTL8XXXU_UNTESTED
+# gate, no out-of-tree driver needed.
+#
+# Board-specific rather than in defaults/: tied to this exact dongle, not to
+# the board itself.  exynos_defconfig already carries every dependency
+# (CFG80211, MAC80211, LEDS_CLASS, USB), so this is the only line needed.
+CONFIG_RTL8XXXU=m
