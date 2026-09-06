@@ -1,0 +1,5 @@
+# U-Boot's odroid-xu3_defconfig enables CONFIG_TOOLS_MKEFICAPSULE, whose host
+# tool links against the sandbox's own net-libs/gnutls for PKCS#11 support
+# (see sandbox-packages.use). Named explicitly here so --changed-use actually
+# rebuilds it instead of leaving an already-installed, flag-less copy in place.
+net-libs/gnutls
