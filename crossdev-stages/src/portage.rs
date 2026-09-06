@@ -15,8 +15,42 @@ fn shell_quote_atoms(atoms: &[&str]) -> String {
         .join(" ")
 }
 
-/// Single supported llvm slot; dev-lang/rust-1.95.0 has `LLVM_COMPAT=( 22 )`.
+/// Single supported llvm slot; dev-lang/rust-1.95.0 has `LLVM_COMPAT=( 22 )`,
+/// and media-libs/mesa-26.2.1 has `LLVM_COMPAT=( {18..22} )` -- 22 is the
+/// newest slot both agree on. (llvm-runtimes/libclc, mesa's OpenCL
+/// dependency pulled in even without the vulkan USE flag, has no such cap on
+/// its own and defaults to the newest ebuild otherwise, which wants a newer
+/// clang than mesa's own LLVM_COMPAT ceiling supports -- see LLVM_RUNTIMES
+/// below.)
 pub const LLVM_SLOT: &str = "22";
+
+/// Packages pinned to [`LLVM_SLOT`] alongside llvm-core/*, grouped by
+/// category. None of these have an `LLVM_COMPAT` ceiling of their own the
+/// way media-libs/mesa or dev-lang/rust do, so left unpinned each resolves
+/// independently to whatever is newest -- and each newest version wants a
+/// newer llvm-core/clang or llvm-core/llvm than the actual consumer up the
+/// chain (mesa, mesa_clc) supports. Confirmed by hitting this one layer at
+/// a time while bringing up odroid-xu4's mesa[panfrost] build:
+/// llvm-runtimes/libclc (mesa's OpenCL dep, pulled in even without the
+/// vulkan USE flag) needed pinning first, then dev-util/spirv-llvm-translator
+/// (libclc's own SPIR-V/LLVM-IR translator dependency) needed the same
+/// treatment one layer further down. Whichever category, the atom is
+/// `{category}/{pkg}` and the pin is `=​{category}/{pkg}-{LLVM_SLOT}*`.
+const LLVM_PINNED_EXTRA: &[(&str, &[&str])] = &[
+    ("llvm-runtimes", &["libclc"]),
+    ("dev-util", &["spirv-llvm-translator"]),
+];
+
+/// dev-lang/perl pinned version. Every stage3 ships dozens of
+/// `virtual/perl-*` packages hard-locked to the perl slot they were built
+/// against (`dev-lang/perl:0/5.42=` or `=dev-lang/perl-5.42*`). The instant
+/// a newer perl (5.44.0) enters the tree, any `-u`/`--changed-use` pass that
+/// touches an unrelated package can pull it in as a dependency-graph
+/// candidate alongside the still-installed, still-required 5.42, producing
+/// an unresolvable slot conflict. Reproduced even on a from-scratch target,
+/// so this is a genuine tree inconsistency rather than accumulated state --
+/// pin to the version the virtuals actually want until they catch up.
+pub const PERL_VERSION: &str = "5.42";
 
 /// Write package.mask/pin-gcc + package.unmask/pin-gcc + same-for-llvm into
 /// a portage root (host sandbox, cross-prefix, or target sysroot).
@@ -27,6 +61,9 @@ pub const LLVM_SLOT: &str = "22";
 /// llvm-core/* is always pinned to [`LLVM_SLOT`] (`=...-${slot}*`) —
 /// keeping a fixed slot prevents multi-slot llvm installs that would
 /// bloat the rootfs and confuse llvm-config / clang-driver discovery.
+///
+/// dev-lang/perl is always pinned to [`PERL_VERSION`] — see its doc comment
+/// for the slot conflict this avoids.
 pub fn write_version_pins(portage_root: &Utf8Path, gcc_version: Option<&str>) -> Result<()> {
     let llvm_slot = LLVM_SLOT;
     let mask_dir = portage_root.join("package.mask");
@@ -67,6 +104,23 @@ pub fn write_version_pins(portage_root: &Utf8Path, gcc_version: Option<&str>) ->
         .collect();
     std::fs::write(mask_dir.join("pin-llvm"), mask)?;
     std::fs::write(unmask_dir.join("pin-llvm"), unmask)?;
+
+    for (category, pkgs) in LLVM_PINNED_EXTRA {
+        let mask: String = pkgs.iter().map(|p| format!("{category}/{p}\n")).collect();
+        let unmask: String = pkgs
+            .iter()
+            .map(|p| format!("={category}/{p}-{llvm_slot}*\n"))
+            .collect();
+        let name = format!("pin-llvm-extra-{category}");
+        std::fs::write(mask_dir.join(&name), mask)?;
+        std::fs::write(unmask_dir.join(&name), unmask)?;
+    }
+
+    std::fs::write(mask_dir.join("pin-perl"), "dev-lang/perl\n")?;
+    std::fs::write(
+        unmask_dir.join("pin-perl"),
+        format!("=dev-lang/perl-{PERL_VERSION}*\n"),
+    )?;
 
     Ok(())
 }
@@ -117,10 +171,19 @@ impl<'a> MakeConf<'a> {
                 "MAKEOPTS",
                 &format!("-j{jobs} --load-average {load}"),
             )?;
+            // --backtrack: default 20 is not enough once a resolve has to
+            // juggle a real package list (board target-packages.txt) against
+            // the pin-{gcc,llvm,llvm-runtimes} mask/unmask files. Portage's
+            // solver hit the cap and reported the first dead end it found
+            // (an unrelated newest-version candidate whose own dependency
+            // was masked) instead of continuing on to the pinned version
+            // that actually satisfies everything -- deps that resolve fine
+            // in isolation (`emerge -pv` on the one atom) failed as part of
+            // the full board package set for exactly this reason.
             set_make_conf_var(
                 &make_conf,
                 "EMERGE_DEFAULT_OPTS",
-                &format!("--jobs={jobs} --load-average {load}"),
+                &format!("--jobs={jobs} --load-average {load} --backtrack=100"),
             )?;
             // buildpkg only where there is a keyed directory to build into:
             // a binary package is only safe to reuse under the flags that
@@ -336,7 +399,7 @@ impl<'a> Portage<'a> {
     pub fn cross_update(&self, chost: &str, packages: &[&str]) -> Result<()> {
         let pkgs = packages.join(" ");
         self.run_emerge(&format!(
-            "ROOT=/target {chost}-emerge -b -k -uDN --keep-going {pkgs}"
+            "ROOT=/target {chost}-emerge -b -k -uDN --keep-going --backtrack=100 {pkgs}"
         ))
     }
 
@@ -344,14 +407,16 @@ impl<'a> Portage<'a> {
     /// Uses `{chost}-emerge` which crossdev installs.
     pub fn cross_emerge(&self, chost: &str, packages: &[&str]) -> Result<()> {
         let pkgs = shell_quote_atoms(packages);
-        self.run_emerge(&format!("ROOT=/target {chost}-emerge -b -k {pkgs}"))
+        self.run_emerge(&format!(
+            "ROOT=/target {chost}-emerge -b -k --backtrack=100 {pkgs}"
+        ))
     }
 
     /// Cross-emerge with `USE=build` for bootstrapping (baselayout, portage).
     pub fn cross_emerge_build(&self, chost: &str, packages: &[&str]) -> Result<()> {
         let pkgs = shell_quote_atoms(packages);
         self.run_emerge(&format!(
-            "USE=build ROOT=/target {chost}-emerge -b -k {pkgs}"
+            "USE=build ROOT=/target {chost}-emerge -b -k --backtrack=100 {pkgs}"
         ))
     }
 

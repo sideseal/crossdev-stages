@@ -121,7 +121,7 @@ impl Target {
             });
         }
         runner.run(&format!(
-            "ROOT=/target {chost}-emerge -b -k{keep_going} {packages}"
+            "ROOT=/target {chost}-emerge -b -k{keep_going} --backtrack=100 {packages}"
         ))?;
 
         tracing::info!("Cross-emerging portage…");
@@ -170,7 +170,7 @@ impl Target {
         tracing::info!("Rebuilding @world in target…");
         runner.run(&format!(
             "KERNEL_DIR=/usr/src/linux ROOT=/target {chost}-emerge \
-             -b -k --jobs={jobs} --load-average {load} -e @world"
+             -b -k --jobs={jobs} --load-average {load} --backtrack=100 -e @world"
         ))?;
 
         self.update_ldconfig(ws, sandbox)?;
