@@ -1,0 +1,4 @@
+# tools/mkeficapsule (built by the bootloader step's HOSTLD, not by any
+# ebuild) fails to link with "undefined reference to `gnutls_pkcs11_init`"
+# and friends unless the sandbox's own gnutls was built with PKCS#11 support.
+net-libs/gnutls pkcs11
