@@ -130,6 +130,57 @@ USB and gigabit ethernet over an NFS root.  Note it is an HC1, not an XU4 - the
 `boot-odroid-xu3-*` builders have been dead since 2019 - and its last run was
 June 2026.
 
+## Docker
+
+`KERNEL_CONFIG_FRAGMENTS` includes `defaults/kernel-config/docker`:
+namespaces (including `USER_NS`), the cgroup controllers moby's own
+`pkg_setup()` check requires, netfilter/bridge/overlay networking, and
+`OVERLAY_FS` for the storage driver.  That fragment is generic and
+reusable — any board can pull it in the same way.
+
+`app-containers/docker` itself is deliberately **not** in
+`target-packages.txt`.  It's Go with cgo, and this project's cross-toolchain
+has never been proven against a cgo build; rather than debug that blind,
+install it natively on the board after first boot, where it builds with its
+own native compiler instead of being cross-compiled:
+
+```sh
+emerge-webrsync              # or: emerge --sync
+emerge app-containers/docker
+rc-update add docker default
+rc-service docker start
+```
+
+The kernel side is baked into every image built from this board directory
+regardless of whether docker is ever installed, so this is a one-time
+post-boot step, not something that has to happen per rebuild.
+
+## WiFi (USB dongle)
+
+Tested against a Realtek RTL8188FU / RTL8188FTV ("802.11b/g/n 1T1R") USB
+dongle, `lsusb` ID `0bda:f179`.  Mainline's `rtl8xxxu` driver
+(`drivers/net/wireless/realtek/rtl8xxxu/8188f.c`) maps `0xf179` to
+`rtl8188fu_fops` directly — no `CONFIG_RTL8XXXU_UNTESTED` gate, no
+out-of-tree driver.  `kernel-config/wifi-rtl8188fu` is a single line,
+`CONFIG_RTL8XXXU=m`; `exynos_defconfig` already carries every dependency
+(`CFG80211`, `MAC80211`, `LEDS_CLASS`, `USB`).  `FIRMWARE_DIRS` includes
+`rtlwifi`, which carries `rtl8188fufw.bin`.  `wpa_supplicant`, `iw` and
+`wireless-regdb` are baked into `target-packages.txt`.
+
+None of that is enough to associate to a network on its own, and it never
+will be from this repo: an SSID and a password are a per-deployment secret,
+not something to commit.  Configure it on the board after boot:
+
+```sh
+wpa_passphrase 'your-ssid' 'your-password' > /etc/wpa_supplicant/wpa_supplicant.conf
+rc-update add wpa_supplicant default
+rc-service wpa_supplicant start
+dhcpcd wlan0                 # or add wlan0 to net.wlan0 in /etc/conf.d
+```
+
+`iw dev` should list `wlan0` once the module loads; `dmesg | grep rtl8xxxu`
+confirms the driver bound and which firmware it loaded.
+
 ## Gotchas
 
 - **U-Boot cannot netboot as configured.**  `odroid-xu3_defconfig` has
@@ -310,6 +361,12 @@ login banner down the screen, because its getty ran without `-L` on a debug
 header that has no modem control lines.  That is fixed in the framework, and
 the fix is in the current image, but the current image has not been on the
 board.
+
+A build made 2026-09-06 additionally carries the Docker kernel config and the
+RTL8188FU WiFi support described above.  It compiled and packed cleanly
+(ABI check passed against 1663 binaries, 15 minutes end to end from a warm
+toolchain/binpkg cache) but the same caveat applies: built, not yet flashed
+or booted.
 
 There is no serial log committed under `evidence/` yet, so nothing here can be
 checked by anything but a person reading it.
