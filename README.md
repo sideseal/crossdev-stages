@@ -161,6 +161,68 @@ Linux 5.11 or newer with unprivileged user-namespace overlayfs enabled
 others).  The store is mounted as overlayfs inside a hakoniwa user
 namespace; macOS/BSD are not supported.
 
+### Building without a Gentoo host
+
+Everything above assumes the host itself is Gentoo -- `sandbox prepare`
+emerges into `/`. On a non-Gentoo host (tested: Ubuntu/WSL2), run the tool
+inside a Gentoo container instead of trying to make it work on the host
+directly:
+
+```sh
+# SYS_ADMIN + unconfined seccomp/apparmor are what hakoniwa's own overlayfs
+# mounts need; there is nothing docker-specific about the requirement.
+docker run -d --name gentoo-build \
+  --cap-add=SYS_ADMIN \
+  --security-opt seccomp=unconfined \
+  --security-opt apparmor=unconfined \
+  --cpus=<N> \
+  --shm-size=<size> \
+  -v "$(pwd)":/root/crossdev-stages \
+  -v /a/real/host/directory:/home/builder/.cache \
+  gentoo/stage3 sleep infinity
+
+docker exec gentoo-build useradd -m -u 1000 builder  # unless the image has one
+docker exec gentoo-build chmod o+x /root             # sandbox run traverses this as non-root
+```
+
+Two things in that command matter more than they look:
+
+- **The cache bind mount must be real host storage, not Docker's own
+  overlay2 backing store.** hakoniwa mounts its own overlayfs for every
+  sandboxed command; overlayfs-on-overlayfs is a kernel limitation Docker's
+  storage driver runs straight into. `~/.cache/crossdev-stages` has to live
+  on an ext4/xfs/whatever bind mount, not inside the container's writable
+  layer.
+- **`--shm-size` matters for real.** mesa/libclc's build wants a lot of
+  tmpfs; short of it, portage reduces job parallelism and keeps going rather
+  than failing outright (`/dev/shm has insufficient free space, emerge job
+  parallelism reduced`) -- a speed knob, not a hard requirement, but a large
+  one on any board that touches mesa.
+
+Build the `crossdev-stages` binary itself on the *actual host*, not inside
+the container -- a bare stage3 has no cargo, and none is needed: glibc is
+backward- but not forward-compatible (see ABI verification below), so a
+binary linked against an equal-or-older glibc than the container's runs
+inside it fine.
+
+```sh
+cargo build --release --manifest-path crossdev-stages/Cargo.toml
+```
+
+From here every command is the Quick start section above, run through
+`docker exec` against the container instead of directly:
+
+```sh
+docker exec -u builder -e USER=builder -w /root/crossdev-stages gentoo-build \
+  ./target/release/crossdev-stages sandbox setup
+```
+
+`-e USER=builder` is not optional: hakoniwa's rootless mode reads `$USER` to
+size its subuid mapping, and `docker exec` does not carry over the
+container's own default environment the way its `ENTRYPOINT` would. Miss it
+and the mapping silently narrows to a single UID, and any extraction needing
+more than one ends up owned wrong.
+
 ## Dependencies
 ```sh
 emerge crossdev merge-usr git
@@ -525,15 +587,21 @@ table, so the value has to be known first.
 ### Toolchain version pins
 
 Every portage root the tool manages (host sandbox, crossdev prefix,
-target sysroot) gets `package.mask/pin-{gcc,llvm}` +
-`package.unmask/pin-{gcc,llvm}`: gcc is pinned to
+target sysroot) gets `package.mask/pin-{gcc,llvm,perl}` +
+`package.unmask/pin-{gcc,llvm,perl}`: gcc is pinned to
 `=sys-devel/gcc-${BOARD_GCC_VERSION}*` (host sandbox keeps its stage3
-default), llvm-core/* to a single slot hardcoded in
-`portage::LLVM_SLOT`.  This keeps `target update` and later emerges
-from silently jumping gcc majors (binpkg ABI breakage) or mixing llvm
-slots.  Override by editing the pin files in the respective
-`etc/portage/`, or change `BOARD_GCC_VERSION` — the files are rewritten
-on the next prepare/crossdev/stage run.
+default), llvm-core/* (plus llvm-runtimes/libclc and
+dev-util/spirv-llvm-translator, which have no `LLVM_COMPAT` ceiling of
+their own) to a single slot hardcoded in `portage::LLVM_SLOT`, and
+dev-lang/perl to `portage::PERL_VERSION` -- every stage3 ships dozens of
+`virtual/perl-*` packages hard-locked to the perl slot they were built
+against, and an unpinned perl can get pulled into the same dependency
+graph as one of them, producing an unresolvable slot conflict.  This
+keeps `target update` and later emerges from silently jumping gcc majors
+(binpkg ABI breakage), mixing llvm slots, or hitting that perl conflict.
+Override by editing the pin files in the respective `etc/portage/`, or
+change `BOARD_GCC_VERSION` — the files are rewritten on the next
+prepare/crossdev/stage run.
 
 ### The `crossdev-stages` portage overlay
 
