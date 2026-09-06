@@ -1,6 +1,6 @@
-use camino::Utf8Path;
-use crate::{board, image, sandbox, workspace::Workspace};
 use crate::error::Result;
+use crate::{board, image, sandbox, workspace::Workspace};
+use camino::Utf8Path;
 
 pub fn run(ws: &Workspace, boards_root: &Utf8Path, tsv: bool) -> Result<()> {
     let tty = !tsv;
@@ -12,7 +12,13 @@ pub fn run(ws: &Workspace, boards_root: &Utf8Path, tsv: bool) -> Result<()> {
     if tty {
         println!("Sandboxes ({}):", sandboxes.len());
         for s in &sandboxes {
-            let state = if s.prepared { "prepared" } else { "unpacked" };
+            let state = if s.prepared {
+                "prepared"
+            } else if s.bare_prepared {
+                "bare"
+            } else {
+                "unpacked"
+            };
             println!("  {:<20} {:<10} {}", s.name, s.arch, state);
         }
         println!("\nBoards ({}):", boards.len());
@@ -22,10 +28,18 @@ pub fn run(ws: &Workspace, boards_root: &Utf8Path, tsv: bool) -> Result<()> {
                 println!("  {:<16} {:<10}{tag}", name, b.arch);
             }
         }
-        println!("\nBuilds (latest {}/{}):", builds.len().min(5), builds.len());
+        println!(
+            "\nBuilds (latest {}/{}):",
+            builds.len().min(5),
+            builds.len()
+        );
         for dir in builds.iter().take(5) {
             if let Some(b) = image::Build::open((*dir).clone()) {
-                let status = if b.dir.join(".packed").exists() { "packed" } else { "incomplete" };
+                let status = if b.dir.join(".packed").exists() {
+                    "packed"
+                } else {
+                    "incomplete"
+                };
                 let image = std::fs::read_to_string(b.dir.join(".image"))
                     .map(|s| format!(" ({})", s.trim()))
                     .unwrap_or_default();
@@ -34,7 +48,13 @@ pub fn run(ws: &Workspace, boards_root: &Utf8Path, tsv: bool) -> Result<()> {
         }
     } else {
         for s in &sandboxes {
-            let state = if s.prepared { "prepared" } else { "unpacked" };
+            let state = if s.prepared {
+                "prepared"
+            } else if s.bare_prepared {
+                "bare"
+            } else {
+                "unpacked"
+            };
             println!("sandbox\t{}\t{}\t{}", s.name, s.arch, state);
         }
         for name in &boards {
@@ -44,7 +64,11 @@ pub fn run(ws: &Workspace, boards_root: &Utf8Path, tsv: bool) -> Result<()> {
         }
         for dir in builds.iter().take(10) {
             if let Some(b) = image::Build::open((*dir).clone()) {
-                let status = if b.dir.join(".packed").exists() { "packed" } else { "incomplete" };
+                let status = if b.dir.join(".packed").exists() {
+                    "packed"
+                } else {
+                    "incomplete"
+                };
                 let image = std::fs::read_to_string(b.dir.join(".image"))
                     .map(|s| s.trim().to_string())
                     .unwrap_or_else(|_| "-".into());

@@ -11,10 +11,7 @@ use crate::target::Target;
 use crate::workspace::Workspace;
 
 fn project_root(boards_root: &Utf8Path) -> Utf8PathBuf {
-    boards_root
-        .parent()
-        .unwrap_or(boards_root)
-        .to_path_buf()
+    boards_root.parent().unwrap_or(boards_root).to_path_buf()
 }
 
 // ── Build directory ─────────────────────────────────────────────────────────
@@ -26,21 +23,20 @@ pub struct Build {
 
 impl Build {
     pub fn create(ws: &Workspace, board: &str) -> Result<Self> {
-        if let Ok(builds) = ws.list_builds() {
-            for dir in builds {
-                if let Some(b) = Self::open(dir.clone()) {
-                    if b.board == board && !b.is_done("packed") {
-                        tracing::info!("Resuming build: {}", dir);
-                        return Ok(b);
-                    }
-                }
-            }
+        // One build directory per board.  Reuse it across re-runs: the
+        // timestamp written at first create stays put, so a re-pack
+        // overwrites the same `*-<ts>.img.xz` instead of accumulating
+        // copies.  To start over (and pick up a fresh timestamp), prune
+        // the board's build dir first.
+        let dir = ws.builds_dir().join(board);
+        if let Some(b) = Self::open(dir.clone()) {
+            tracing::info!("Reusing build: {}", dir);
+            return Ok(b);
         }
-        let ts = Utc::now().format("%Y%m%dT%H%M%SZ");
-        let name = format!("{board}-{ts}");
-        let dir = ws.builds_dir().join(&name);
         std::fs::create_dir_all(&dir)?;
         std::fs::write(dir.join(".board"), board)?;
+        let ts = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+        std::fs::write(dir.join(".timestamp"), &ts)?;
         Ok(Self {
             dir,
             board: board.to_string(),
@@ -52,6 +48,15 @@ impl Build {
             .ok()
             .map(|s| s.trim().to_string())?;
         Some(Self { dir, board })
+    }
+
+    /// Wall-clock build timestamp embedded in the produced image filename
+    /// (stable across resume — written once at create).
+    pub fn timestamp(&self) -> String {
+        std::fs::read_to_string(self.dir.join(".timestamp"))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| Utc::now().format("%Y%m%dT%H%M%SZ").to_string())
     }
 
     fn marker(&self, step: &str) -> Utf8PathBuf {
@@ -134,11 +139,50 @@ fn default_deps(
         let host_runner = board_runner(sandbox, board);
         let portage = Portage::new(&host_runner);
         let content = std::fs::read_to_string(&sandbox_pkgs)?;
-        let pkgs: Vec<&str> = content
+        let lines: Vec<&str> = content
             .lines()
             .map(str::trim)
             .filter(|l| !l.is_empty() && !l.starts_with('#'))
             .collect();
+
+        // Write package.accept_keywords entries for packages with keyword overrides.
+        // Format: "atom [keywords]" — e.g. "sys-boot/syslinux **" or "dev-libs/foo ~amd64"
+        let accept_keywords_dir = sandbox.dir.join("etc/portage/package.accept_keywords");
+        std::fs::create_dir_all(&accept_keywords_dir)?;
+        let mut pkgs: Vec<&str> = Vec::new();
+        for line in &lines {
+            let parts: Vec<&str> = line.splitn(2, char::is_whitespace).collect();
+            let atom = parts[0];
+            pkgs.push(atom);
+            if parts.len() > 1 {
+                let keywords = parts[1].trim();
+                let safe_name = atom.replace('/', "_");
+                std::fs::write(
+                    accept_keywords_dir.join(&safe_name),
+                    format!("{atom} {keywords}\n"),
+                )?;
+            }
+        }
+
+        // Write package.use entries from sandbox-packages.use.
+        // Format: "atom use_flags..." — e.g. "sys-boot/syslinux bios -uefi"
+        let sandbox_use = boards_root.join(&board.name).join("sandbox-packages.use");
+        if sandbox_use.exists() {
+            let use_dir = sandbox.dir.join("etc/portage/package.use");
+            std::fs::create_dir_all(&use_dir)?;
+            let use_content = std::fs::read_to_string(&sandbox_use)?;
+            for line in use_content.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let parts: Vec<&str> = line.splitn(2, char::is_whitespace).collect();
+                let atom = parts[0];
+                let safe_name = atom.replace('/', "_");
+                std::fs::write(use_dir.join(&safe_name), format!("{line}\n"))?;
+            }
+        }
+
         if !pkgs.is_empty() {
             portage.emerge(&pkgs)?;
         }
@@ -163,10 +207,9 @@ fn default_deps(
 }
 
 fn default_checkout(runner: &SandboxRunner, board: &BoardConfig) -> Result<()> {
-    crate::bootloader::opensbi::clone(runner, board)?;
-    crate::bootloader::uboot::clone(runner, board)?;
+    crate::bootloader::clone_pipeline(runner, board)?;
     if let Some(repo) = &board.firmware_repo {
-        let tag = board.u_boot_tag.as_deref().unwrap_or("main");
+        let tag = board.firmware_tag.as_deref().unwrap_or("master");
         crate::source_cache::cached_clone(runner, repo, tag, "/build/firmware", "firmware")?;
     }
     crate::source_cache::cached_clone(
@@ -179,8 +222,7 @@ fn default_checkout(runner: &SandboxRunner, board: &BoardConfig) -> Result<()> {
 }
 
 fn default_bootloader(runner: &SandboxRunner, board: &BoardConfig) -> Result<()> {
-    crate::bootloader::opensbi::build(runner, board)?;
-    crate::bootloader::uboot::build(runner, board)
+    crate::bootloader::build_pipeline(runner, board)
 }
 
 fn default_kernel(runner: &SandboxRunner, board: &BoardConfig) -> Result<()> {
@@ -194,7 +236,7 @@ fn default_kernel(runner: &SandboxRunner, board: &BoardConfig) -> Result<()> {
             })?;
     runner.run(&format!(
         "make -C /build/linux ARCH={karch} CROSS_COMPILE={cc} {defconfig} && \
-         make -C /build/linux ARCH={karch} CROSS_COMPILE={cc} -j$(nproc)",
+         make -C /build/linux ARCH={karch} CROSS_COMPILE={cc} WERROR=0 -j$(nproc)",
         cc = board.cross_compile,
         defconfig = board.kernel_defconfig,
     ))
@@ -212,6 +254,10 @@ fn default_assemble(runner: &SandboxRunner, board: &BoardConfig) -> Result<()> {
 
     runner.run("mkdir -p /build/gen/root /build/gen/boot")?;
     runner.run("cp -a /target/. /build/gen/root/")?;
+    // unpack_tarball excludes ./dev to avoid permission errors in rootless containers.
+    // Recreate the empty mount-point directories so the kernel can mount devtmpfs,
+    // procfs, sysfs and tmpfs at boot.
+    runner.run("mkdir -p /build/gen/root/{dev,proc,sys,run,tmp}")?;
 
     runner.run(&format!(
         "make -C /build/linux ARCH={karch} CROSS_COMPILE={cc} \
@@ -231,6 +277,17 @@ fn default_assemble(runner: &SandboxRunner, board: &BoardConfig) -> Result<()> {
 
     runner
         .run("mkdir -p /build/gen/root/etc/runlevels/{boot,default,nonetwork,shutdown,sysinit}")?;
+
+    // Board-agnostic: grow-rootfs oneshot, runs once on first boot, fills
+    // the rootfs partition out to the disk end + resize2fs.  Needs
+    // sys-block/parted + sys-fs/e2fsprogs in the target.
+    runner.run(
+        "install -m 0755 /scripts/defaults/scripts/grow-rootfs.initd \
+           /build/gen/root/etc/init.d/grow-rootfs && \
+         ln -sf /etc/init.d/grow-rootfs \
+           /build/gen/root/etc/runlevels/boot/grow-rootfs",
+    )?;
+
     for svc in &board.services {
         if let Some((name, runlevel)) = svc.split_once(':') {
             runner.run(&format!(
@@ -276,7 +333,12 @@ fn default_assemble(runner: &SandboxRunner, board: &BoardConfig) -> Result<()> {
     runner.run("/usr/local/bin/ldconfig -v -r /build/gen/root")
 }
 
-fn default_pack(runner: &SandboxRunner, board: &BoardConfig, build: &Build, boards_root: &Utf8Path) -> Result<()> {
+fn default_pack(
+    runner: &SandboxRunner,
+    board: &BoardConfig,
+    build: &Build,
+    boards_root: &Utf8Path,
+) -> Result<()> {
     let board_cfg = boards_root.join(&board.name).join("genimage.cfg");
     let cfg_path = if board_cfg.exists() {
         format!("/scripts/boards/{}/genimage.cfg", board.name)
@@ -284,7 +346,7 @@ fn default_pack(runner: &SandboxRunner, board: &BoardConfig, build: &Build, boar
         "/scripts/genimage.cfg".to_string()
     };
 
-    let img_name = board
+    let cfg_name = board
         .image_name
         .clone()
         .unwrap_or_else(|| format!("gentoo-linux-{}_dev-sdcard.img", board.name));
@@ -292,8 +354,19 @@ fn default_pack(runner: &SandboxRunner, board: &BoardConfig, build: &Build, boar
     runner.run(&format!(
         "rm -rf /build/tmp && cd /build && \
          genimage --config {cfg_path} \
+         --mkdosfs mkfs.vfat \
          --inputpath /build --outputpath /build --rootpath /build/gen"
     ))?;
+
+    // Stamp the build timestamp into the image filename so successive builds
+    // don't shadow each other when the user copies them out, e.g.
+    //   gentoo-linux-premier-p550_dev-sdcard-20260622T031736Z.img.xz
+    let ts = build.timestamp();
+    let img_name = match cfg_name.strip_suffix(".img") {
+        Some(stem) => format!("{stem}-{ts}.img"),
+        None => format!("{cfg_name}-{ts}"),
+    };
+    runner.run(&format!("mv /build/{cfg_name} /build/{img_name}"))?;
 
     let compression = board.compression.as_deref().unwrap_or("xz");
     let final_name = match compression {
@@ -339,7 +412,14 @@ pub fn build(
     let bld = Build::create(ws, &board.name)?;
 
     let default_steps = if board.build_steps.is_empty() {
-        vec!["deps", "checkout", "bootloader", "kernel", "assemble", "pack"]
+        vec![
+            "deps",
+            "checkout",
+            "bootloader",
+            "kernel",
+            "assemble",
+            "pack",
+        ]
     } else {
         board.build_steps.iter().map(String::as_str).collect()
     };
@@ -361,19 +441,46 @@ pub fn build(
             .with_cache(ws.base());
 
         let result = match *step {
-            "deps" => run_step("deps", "deps", &bld, &runner, boards_root, board,
-                |_r| default_deps(_r, sandbox, target, board, boards_root)),
-            "checkout" => run_step("checkout", "sources", &bld, &runner, boards_root, board,
-                |r| default_checkout(r, board)),
-            "bootloader" => run_step("bootloader", "bootloader", &bld, &runner, boards_root, board,
-                |r| default_bootloader(r, board)),
-            "kernel" => run_step("kernel", "kernel", &bld, &runner, boards_root, board,
-                |r| default_kernel(r, board)),
-            "assemble" => run_step("assemble", "assembled", &bld, &runner, boards_root, board,
-                |r| default_assemble(r, board)),
-            "pack" => run_step("pack", "packed", &bld, &runner, boards_root, board,
-                |r| default_pack(r, board, &bld, boards_root)),
-            other => { tracing::warn!("Unknown step '{}', skipping.", other); Ok(()) },
+            "deps" => run_step("deps", "deps", &bld, &runner, boards_root, board, |_r| {
+                default_deps(_r, sandbox, target, board, boards_root)
+            }),
+            "checkout" => run_step(
+                "checkout",
+                "sources",
+                &bld,
+                &runner,
+                boards_root,
+                board,
+                |r| default_checkout(r, board),
+            ),
+            "bootloader" => run_step(
+                "bootloader",
+                "bootloader",
+                &bld,
+                &runner,
+                boards_root,
+                board,
+                |r| default_bootloader(r, board),
+            ),
+            "kernel" => run_step("kernel", "kernel", &bld, &runner, boards_root, board, |r| {
+                default_kernel(r, board)
+            }),
+            "assemble" => run_step(
+                "assemble",
+                "assembled",
+                &bld,
+                &runner,
+                boards_root,
+                board,
+                |r| default_assemble(r, board),
+            ),
+            "pack" => run_step("pack", "packed", &bld, &runner, boards_root, board, |r| {
+                default_pack(r, board, &bld, boards_root)
+            }),
+            other => {
+                tracing::warn!("Unknown step '{}', skipping.", other);
+                Ok(())
+            }
         };
 
         let elapsed = step_start.elapsed();

@@ -1,7 +1,8 @@
 use camino::{Utf8Path, Utf8PathBuf};
 use hakoniwa::{Container, Namespace, Runctl};
 
-use crate::error::{check_status, Result};
+use crate::error::{check_status, Error, Result};
+use crate::workspace::Workspace;
 
 /// Abstraction over the hakoniwa container API, modeling the four
 /// `run*` variants from `sandbox-stage.sh`.
@@ -123,12 +124,27 @@ impl SandboxRunner {
             .runctl(Runctl::RootdirRW)
             .runctl(Runctl::AllowNewPrivs)
             .devfsmount("/dev")
-            .bindmount_ro("/etc/resolv.conf", "/etc/resolv.conf")
             .tmpfsmount("/tmp")
             .tmpfsmount("/dev/shm")
-            // Explicit bind mount so portage logs are always reachable at
-            // <sandbox_dir>/var/log/ from the host.
+            // Bind the dedicated host log dir at /var/log inside the container.
             .bindmount_rw(self.log_dir.as_str(), "/var/log");
+
+        // On systemd systems /etc/resolv.conf is typically a symlink to
+        // /run/systemd/resolve/stub-resolv.conf, which doesn't exist inside
+        // the sandbox chroot.  When the symlink target isn't reachable inside
+        // the container root, fall back to a static resolv.conf (1.1.1.1).
+        let host_resolv = Utf8Path::new("/etc/resolv.conf");
+        if host_resolv.is_file() && can_bindmount_resolv(&self.sandbox_dir) {
+            c.bindmount_ro("/etc/resolv.conf", "/etc/resolv.conf");
+        } else {
+            let sandbox_resolv = self.sandbox_dir.join("etc/resolv.conf");
+            let _ = std::fs::create_dir_all(sandbox_resolv.parent().unwrap());
+            std::fs::write(
+                &sandbox_resolv,
+                "nameserver 1.1.1.1\nnameserver 2606:4700:4700::1111\n",
+            )
+            .expect("failed to write fallback resolv.conf");
+        }
         // Map caller → root, plus subordinate IDs for portage user etc.
         c.uidmaps(&uid_maps());
         c.gidmaps(&gid_maps());
@@ -143,6 +159,31 @@ impl SandboxRunner {
             c.bindmount_ro(scripts.as_str(), "/scripts");
         }
         c
+    }
+}
+
+/// Check whether the host `/etc/resolv.conf` can be bind-mounted into a
+/// container rooted at `sandbox_dir`.  On systemd hosts it's a symlink to
+/// `/run/systemd/resolve/stub-resolv.conf`; the bind mount will fail with
+/// EPERM unless the symlink target also exists inside the sandbox.
+fn can_bindmount_resolv(sandbox_dir: &Utf8Path) -> bool {
+    let host_resolv = std::path::Path::new("/etc/resolv.conf");
+    match host_resolv.canonicalize() {
+        Ok(real) => {
+            let real_str = match real.to_str() {
+                Some(s) => s,
+                None => return false,
+            };
+            // If the canonical path starts with /run/systemd, the target
+            // won't exist inside the sandbox — fall back to static DNS.
+            if real_str.starts_with("/run/systemd") {
+                return false;
+            }
+            // Otherwise check that the target exists inside the sandbox.
+            let stripped = real_str.trim_start_matches('/');
+            sandbox_dir.join(stripped).is_file()
+        }
+        Err(_) => false,
     }
 }
 
@@ -189,11 +230,7 @@ pub fn destroy_dir(dir: &Utf8Path, cache_base: &Utf8Path) -> Result<()> {
     if !dir.is_dir() {
         return Ok(());
     }
-    let dir_in_container = format!(
-        "/cache/{}",
-        dir.strip_prefix(cache_base)
-            .unwrap_or(dir)
-    );
+    let dir_in_container = format!("/cache/{}", dir.strip_prefix(cache_base).unwrap_or(dir));
 
     let mut container = Container::new();
     container
@@ -222,13 +259,19 @@ pub fn destroy_dir(dir: &Utf8Path, cache_base: &Utf8Path) -> Result<()> {
 /// are available from the host system).  The entire cache base directory is
 /// bind-mounted read-write at `/cache` so that both the source tarball and
 /// the destination directory are reachable inside the container.
-pub fn unpack_tarball(source_stage: &Utf8Path, dest_dir: &Utf8Path, cache_base: &Utf8Path) -> Result<()> {
+pub fn unpack_tarball(
+    source_stage: &Utf8Path,
+    dest_dir: &Utf8Path,
+    cache_base: &Utf8Path,
+) -> Result<()> {
     std::fs::create_dir_all(dest_dir)?;
 
     // Paths inside the container: /cache/<relative_to_cache_base>
     let stage_in_container = format!(
         "/cache/{}",
-        source_stage.strip_prefix(cache_base).unwrap_or(source_stage)
+        source_stage
+            .strip_prefix(cache_base)
+            .unwrap_or(source_stage)
     );
     let dest_in_container = format!(
         "/cache/{}",
@@ -326,15 +369,181 @@ pub fn pack_tarball(
     check_status(command.status()?).map_err(|e| annotate_cmd(e, &cmd))
 }
 
+/// A stale bind mount left behind after a crashed hakoniwa sandbox session.
+#[derive(Debug, Clone)]
+pub struct StaleMount {
+    pub sandbox: String,
+    pub path: Utf8PathBuf,
+}
+
+/// Paths inside a sandbox tree that `SandboxRunner` may bind-mount.
+fn sandbox_bind_targets(_sandbox_dir: &Utf8Path) -> [&'static str; 2] {
+    ["var/log", "etc/resolv.conf"]
+}
+
+/// Return true when `path` is a mount point in the current mount namespace.
+pub fn is_mount_point(path: &Utf8Path) -> bool {
+    let Ok(canonical) = path.canonicalize_utf8() else {
+        return false;
+    };
+    let Ok(content) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        return false;
+    };
+    content.lines().any(|line| {
+        mount_point_from_mountinfo(line)
+            .and_then(|mp| mp.canonicalize_utf8().ok())
+            .is_some_and(|mp| mp == canonical)
+    })
+}
+
+fn mount_point_from_mountinfo(line: &str) -> Option<Utf8PathBuf> {
+    let before = line.split(" - ").next()?;
+    let mut fields = before.split_whitespace();
+    fields.next()?; // mount id
+    fields.next()?; // parent id
+    fields.next()?; // major:minor
+    fields.next()?; // root
+    let mount_point = fields.next()?;
+    Some(Utf8PathBuf::from(mount_point))
+}
+
+/// Find stale hakoniwa bind mounts under workspace sandboxes.
+pub fn find_stale_sandbox_mounts(ws: &Workspace) -> Result<Vec<StaleMount>> {
+    let mut stale = Vec::new();
+    for sandbox_dir in ws.list_sandboxes()? {
+        let name = sandbox_dir
+            .file_name()
+            .unwrap_or("?")
+            .to_string();
+        for sub in sandbox_bind_targets(&sandbox_dir) {
+            let target = sandbox_dir.join(sub);
+            if target.exists() && is_mount_point(&target) {
+                stale.push(StaleMount {
+                    sandbox: name.clone(),
+                    path: target,
+                });
+            }
+        }
+    }
+    Ok(stale)
+}
+
+/// Lazy-unmount stale sandbox bind mounts so cleanup and the next container run succeed.
+pub fn recover_sandbox_mounts(ws: &Workspace, dry_run: bool) -> Result<usize> {
+    let stale = find_stale_sandbox_mounts(ws)?;
+    let mut count = 0usize;
+    for mount in stale {
+        if dry_run {
+            println!(
+                "Would unmount {} (sandbox {})",
+                mount.path, mount.sandbox
+            );
+        } else {
+            umount_lazy(&mount.path)?;
+            restore_mount_target(&mount.path)?;
+            println!("Unmounted {} (sandbox {})", mount.path, mount.sandbox);
+        }
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// Unmount stale bind targets under `path` before removing a workspace entry.
+pub fn recover_mounts_for_removal(path: &Utf8Path, dry_run: bool) -> Result<usize> {
+    let mut count = 0usize;
+    if path.is_dir() {
+        for sub in sandbox_bind_targets(path) {
+            let target = path.join(sub);
+            if target.exists() && is_mount_point(&target) {
+                if dry_run {
+                    println!("Would unmount {}", target);
+                } else {
+                    umount_lazy(&target)?;
+                    restore_mount_target(&target)?;
+                    println!("Unmounted {}", target);
+                }
+                count += 1;
+            }
+        }
+    }
+    if path.exists() && is_mount_point(path) {
+        if dry_run {
+            println!("Would unmount {}", path);
+        } else {
+            umount_lazy(path)?;
+            restore_mount_target(path)?;
+            println!("Unmounted {}", path);
+        }
+        count += 1;
+    }
+    Ok(count)
+}
+
+fn umount_lazy(path: &Utf8Path) -> Result<()> {
+    let cpath = std::ffi::CString::new(path.as_str())
+        .map_err(|_| Error::CommandFailed {
+            code: 1,
+            reason: format!("mount path contains NUL byte: {path}"),
+        })?;
+    let rc = unsafe { libc::umount2(cpath.as_ptr(), libc::MNT_DETACH) };
+    if rc == 0 {
+        return Ok(());
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::EINVAL) | Some(libc::ENOENT) => Ok(()),
+        Some(code) => Err(Error::CommandFailed {
+            code,
+            reason: format!("umount2 {path}"),
+        }),
+        None => Err(Error::CommandFailed {
+            code: 1,
+            reason: format!("umount2 {path}"),
+        }),
+    }
+}
+
+/// Ensure bind-mount targets exist after a lazy unmount.
+fn restore_mount_target(path: &Utf8Path) -> Result<()> {
+    if path.ends_with("var/log") {
+        std::fs::create_dir_all(path)?;
+    } else if path.ends_with("resolv.conf") && !path.exists() {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(
+            path,
+            "nameserver 1.1.1.1\nnameserver 2606:4700:4700::1111\n",
+        )?;
+    }
+    Ok(())
+}
+
 /// Prefix a failed-command error with the command string for diagnostics.
 fn annotate_cmd(e: crate::error::Error, cmd: &str) -> crate::error::Error {
     match e {
-        crate::error::Error::CommandFailed { code, reason } => {
-            crate::error::Error::CommandFailed {
-                code,
-                reason: format!("{cmd}: {reason}"),
-            }
-        }
+        crate::error::Error::CommandFailed { code, reason } => crate::error::Error::CommandFailed {
+            code,
+            reason: format!("{cmd}: {reason}"),
+        },
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proc_is_a_mount_point() {
+        assert!(is_mount_point(Utf8Path::new("/proc")));
+    }
+
+    #[test]
+    fn regular_dir_is_not_a_mount_point() {
+        let dir = std::env::temp_dir().join("crossdev-stages-mount-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = Utf8PathBuf::try_from(dir).unwrap();
+        assert!(!is_mount_point(&path));
+        let _ = std::fs::remove_dir(&path);
     }
 }

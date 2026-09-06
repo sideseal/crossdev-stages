@@ -1,6 +1,6 @@
 use camino::Utf8PathBuf;
 use clap::builder::styling::{AnsiColor, Styles};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 pub mod board;
 pub mod image;
@@ -117,6 +117,9 @@ pub enum SandboxCmd {
         /// Sandbox name (default: most-recently-modified).
         #[arg(long)]
         name: Option<String>,
+        /// Configure portage and sync the tree, but do not install host packages.
+        #[arg(long)]
+        bare: bool,
     },
     /// Set up the crossdev cross-compiler toolchain inside a sandbox.
     Crossdev {
@@ -229,6 +232,10 @@ pub enum ImageCmd {
         /// Export all build artifacts, not just the final image.
         #[arg(long)]
         all: bool,
+        /// Bundle exported artifacts into a single .tar.xz next to outputs.
+        /// Only meaningful with --all.
+        #[arg(long, requires = "all")]
+        tar: bool,
     },
 }
 
@@ -250,14 +257,40 @@ pub enum StagesCmd {
 
 // ── Maint subcommands ────────────────────────────────────────────────────────
 
+#[derive(Args)]
+pub struct CleanArgs {
+    /// Remove all sandboxes.
+    #[arg(long)]
+    pub sandboxes: bool,
+    /// Remove all target stages.
+    #[arg(long)]
+    pub targets: bool,
+    /// Remove all builds (not just incomplete ones).
+    #[arg(long)]
+    pub builds: bool,
+    /// Remove the git source cache.
+    #[arg(long)]
+    pub sources: bool,
+    /// Remove all downloaded stage3 tarballs.
+    #[arg(long)]
+    pub stages: bool,
+    /// Remove build logs.
+    #[arg(long)]
+    pub logs: bool,
+    /// Remove every category above.
+    #[arg(long)]
+    pub all: bool,
+}
+
 #[derive(Subcommand)]
 pub enum MaintCmd {
-    /// Clean up stale builds and old stage3 tarballs.
-    Cleanup {
-        /// Remove everything (all builds, stages).
-        #[arg(long)]
-        all: bool,
-    },
+    /// Clean up the workspace.
+    ///
+    /// With no flags, garbage-collect: remove incomplete builds and
+    /// stage3 tarballs older than the newest per arch.  Category flags
+    /// wipe whole directories instead; subuid-owned files (portage
+    /// etc.) are removed inside a container, so no sudo is needed.
+    Clean(CleanArgs),
     /// Show build output and logs.
     Logs {
         /// Board name (shows latest build).
@@ -268,4 +301,6 @@ pub enum MaintCmd {
     },
     /// Check environment for common issues.
     Doctor,
+    /// Unmount stale hakoniwa bind mounts left after a crashed sandbox session.
+    Recover,
 }

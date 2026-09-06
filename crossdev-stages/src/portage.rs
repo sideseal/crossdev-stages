@@ -40,7 +40,11 @@ impl<'a> MakeConf<'a> {
         let garch = gentoo_arch(self.arch)?;
         let cflags = self.cflags.unwrap_or_else(|| default_cflags(self.arch));
 
-        set_make_conf_var(&make_conf, "MAKEOPTS", &format!("-j{jobs} --load-average {load}"))?;
+        set_make_conf_var(
+            &make_conf,
+            "MAKEOPTS",
+            &format!("-j{jobs} --load-average {load}"),
+        )?;
         set_make_conf_var(
             &make_conf,
             "EMERGE_DEFAULT_OPTS",
@@ -48,7 +52,11 @@ impl<'a> MakeConf<'a> {
         )?;
         set_make_conf_var(&make_conf, "FEATURES", "parallel-install -merge-wait")?;
         set_make_conf_var(&make_conf, "ACCEPT_KEYWORDS", &format!("~{garch}"))?;
-        set_make_conf_var(&make_conf, "PORT_LOGDIR", &format!("/var/log/portage/{garch}"))?;
+        set_make_conf_var(
+            &make_conf,
+            "PORT_LOGDIR",
+            &format!("/var/log/portage/{garch}"),
+        )?;
 
         // LLVM_TARGETS: host gets the union of every supported arch (so the
         // bundled LLVM inside dev-lang/rust can bootstrap any cross-std);
@@ -167,8 +175,9 @@ impl<'a> Portage<'a> {
     /// Cross-emerge with `USE=build` for bootstrapping (baselayout, portage).
     pub fn cross_emerge_build(&self, chost: &str, packages: &[&str]) -> Result<()> {
         let pkgs = packages.join(" ");
-        self.runner
-            .run(&format!("USE=build ROOT=/target {chost}-emerge -b -k {pkgs}"))
+        self.runner.run(&format!(
+            "USE=build ROOT=/target {chost}-emerge -b -k {pkgs}"
+        ))
     }
 
     /// Run `{chost}-emerge` without overriding ROOT, so packages install into
@@ -180,8 +189,8 @@ impl<'a> Portage<'a> {
     }
 }
 
-/// Install all host-side dependencies required for cross-compilation.
-pub fn install_host_deps(runner: &SandboxRunner) -> Result<()> {
+/// Sync the portage tree inside a sandbox (emerge-webrsync, signing keys).
+pub fn sync_portage_tree(runner: &SandboxRunner) -> Result<()> {
     let portage = Portage::new(runner);
 
     tracing::info!("Syncing portage tree…");
@@ -189,6 +198,13 @@ pub fn install_host_deps(runner: &SandboxRunner) -> Result<()> {
     let _ = portage.getuto();
 
     runner.run("chown -R portage:portage /etc/portage/gnupg")?;
+    Ok(())
+}
+
+/// Install all host-side dependencies required for cross-compilation.
+pub fn install_host_deps(runner: &SandboxRunner) -> Result<()> {
+    sync_portage_tree(runner)?;
+    let portage = Portage::new(runner);
 
     let bin_packages = ["app-arch/zstd", "app-arch/bzip2", "app-arch/xz-utils"];
     tracing::info!("Installing binary packages…");
@@ -218,4 +234,3 @@ pub fn install_host_deps(runner: &SandboxRunner) -> Result<()> {
 
     Ok(())
 }
-

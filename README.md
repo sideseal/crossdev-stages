@@ -9,13 +9,24 @@ Rootless cross-compilation of Gentoo stages using crossdev and hakoniwa
 - [x] Assemble bootable images
 - [x] Per-CFLAGS target stage isolation (glibc-only rebuild)
 - [x] Rust CLI using [hakoniwa](https://github.com/souk4711/hakoniwa) for sandboxing
-- [x] Modular bootloader (opensbi, u-boot, tfa, rkbin)
+- [x] Modular bootloader (opensbi, u-boot, grub, syslinux, tfa, rkbin)
 - [x] File-convention hooks (pre/post/override scripts per build step)
 - [x] Git source cache (bare repo references)
 
-## Platforms
-- riscv64 (BPI-F3, Milk-V Jupiter, DC Roma II, OrangePi RV2, K230, Blackhole P100/P150)
-- aarch64 (Odroid M2 -- testing)
+## Boards
+
+| Board | Arch | Kernel | Boot chain | CFLAGS | Status |
+|---|---|---|---|---|---|
+| k1 | riscv64 | spacemit 6.6 | OpenSBI + U-Boot | `-O3 -march=rv64gcv_zvl256b` | stable |
+| k1-upstream | riscv64 | spacemit k3 | OpenSBI + U-Boot | `-O3 -march=rv64gcv_zvl256b` | testing |
+| k3 | riscv64 | spacemit 6.18 | OpenSBI + U-Boot | `-O3 -march=rva23u64` | stable |
+| k230 | riscv64 | canaan (hdmi) | OpenSBI (payload) + U-Boot | `-O3 -march=rv64gcv_zvl128b` | stable |
+| ky-x1 | riscv64 | spacemit 6.6 | OpenSBI + U-Boot | `-O3 -march=rv64gcv_zvl256b` | stable |
+| blackhole | riscv64 | tenstorrent | OpenSBI (jump, PCIe BAR) | `-O3 -march=rv64gcv_zvl512b` | stable |
+| odroid-m1 | aarch64 | mainline v7.0 | TFA + U-Boot + rkbin | `-O3 -mcpu=cortex-a55` | testing |
+| odroid-m1s | aarch64 | mainline v7.0 | TFA + U-Boot + rkbin | `-O3 -mcpu=cortex-a55` | testing |
+| odroid-m2 | aarch64 | mainline v7.0 | TFA + U-Boot + rkbin | `-O3 -mcpu=cortex-a76.cortex-a55` | testing |
+| pentium-mmx | i586 | mainline v6.12 | BIOS (no firmware) | `-O2 -march=pentium-mmx` | testing |
 
 ## CLI
 
@@ -28,7 +39,7 @@ Commands:
   image     Build board images
   stages    List or download Gentoo stage3 tarballs
   board     Manage and inspect boards
-  maint     Maintenance: cleanup, logs, diagnostics
+  maint     Maintenance: clean, logs, diagnostics
   status    Show overview of sandboxes, targets, builds, and boards
 
 Options:
@@ -41,28 +52,49 @@ Options:
 ### Quick start
 
 ```sh
+# List available boards
+crossdev-stages board list
+
+# Inspect a board configuration
+crossdev-stages board info --board <BOARD>
+
 # Set up host sandbox
 crossdev-stages sandbox setup
 crossdev-stages sandbox prepare
-crossdev-stages sandbox crossdev --arch riscv64 --board k1
+crossdev-stages sandbox crossdev --arch <ARCH> --board <BOARD>
 
 # Create target stage from a stage3 seed
-crossdev-stages target setup --arch riscv64
+crossdev-stages target setup --arch <ARCH>
 crossdev-stages target stage1
 crossdev-stages target update
 
 # Build an image
-crossdev-stages image build --board k1
+crossdev-stages image build --board <BOARD>
 
 # Check status
 crossdev-stages status
 
 # Export the image
-crossdev-stages image export --board k1 -o /tmp/
+crossdev-stages image export --board <BOARD> -o /tmp/
+
+# Export a full flash bundle (all boot blobs + images), optionally as .tar.xz
+crossdev-stages image export --board <BOARD> --all --tar -o /tmp/
 
 # Clean up stale builds and old stage3 tarballs
-crossdev-stages maint cleanup
+crossdev-stages maint clean
+
+# Wipe whole categories (replaces sudo rm -rf ~/.cache/crossdev-stages)
+crossdev-stages maint clean --sandboxes --targets
+crossdev-stages maint clean --all
 ```
+
+`--all` copies every build artifact into a `<BOARD>-flash-bundle/` directory.
+If `boards/<BOARD>/bundle.list` exists it acts as a whitelist: one build-dir
+relative path per line, `#` comments ignored. A missing entry fails the
+export unless prefixed with `optional:`, and the token `@image` resolves to
+the packed image filename (which carries a UTC timestamp) from the build's
+`.image` marker. Without a `bundle.list` the whole build dir is copied,
+skipping the `gen/`, `linux/`, `tmp/`, and `firmware/` source trees.
 
 ### Source cache
 
@@ -103,17 +135,47 @@ Steps: `deps`, `checkout`, `bootloader`, `kernel`, `assemble`, `pack`
 4. post-{step}.sh exists?      -> run it
 ```
 
+### Bootloader pipeline
+
+The `bootloader` step runs an ordered list of stages declared in the
+`BOOT_PIPELINE` array. Valid stage names: `opensbi`, `uboot`, `grub`,
+`syslinux`, `tfa`, `rkbin`, `amlogic-fip` (validated when board.conf is
+loaded). If the key is omitted the default
+`("opensbi" "uboot" "syslinux" "grub")` applies; each stage is a no-op
+unless its board.conf keys are set, so the default covers both the
+RISC-V vendor SDK pattern and the x86 BIOS pattern. An explicitly empty
+array `()` runs no stages (all-prebuilt firmware). Stages pass data
+forward via env exports prepended to later stages' build commands, e.g.
+`tfa` exports `BL31=` and `rkbin` exports `ROCKCHIP_TPL=`, both consumed
+by `uboot`.
+
 ### board.conf variables
 
 | Variable | Required | Description |
 |---|---|---|
-| `BOARD_ARCH` | yes | Target architecture (`riscv64`, `aarch64`) |
+| `BOARD_NAME` | yes | Board identifier (matches directory name) |
+| `BOARD_ARCH` | yes | Target architecture (`riscv64`, `aarch64`, `i586`, `i686`) |
+| `CROSS_COMPILE` | yes | Toolchain prefix (e.g. `riscv64-unknown-linux-gnu-`) |
+| `KERNEL_REPO` | yes | Kernel source repository URL |
+| `KERNEL_DEFCONFIG` | yes | Kernel defconfig name |
+| `CHOST` | no | Override derived CHOST triple (default: auto from arch) |
 | `BOARD_CFLAGS` | no | Board-specific CFLAGS (default: arch default) |
+| `KERNEL_TAG` | no | Kernel git ref (default: top-level `TAG`) |
+| `KERNEL_ARCH` | no | Linux `ARCH=` value (default: auto from `BOARD_ARCH`) |
 | `BUILD_STEPS` | no | Build pipeline steps (default: deps checkout bootloader kernel assemble pack) |
+| `BOOT_PIPELINE` | no | Ordered bootloader stages (default: `("opensbi" "uboot" "syslinux" "grub")`; `()` = none) |
 | `OPENSBI_FW_TYPE` | no | OpenSBI firmware type: `dynamic` (default), `jump`, `payload` |
 | `OPENSBI_MAKE_FLAGS` | no | Extra opensbi make arguments |
 | `U_BOOT_MAKE_FLAGS` | no | Extra u-boot make arguments |
+| `GRUB_PLATFORMS` | no | GRUB platform (e.g. `pc`); enables the `grub` stage (grub-mkimage) |
+| `GRUB_MODULES` | no | GRUB modules embedded in core.img (default: BIOS boot set) |
+| `SYSLINUX_REPO` / `SYSLINUX_TAG` | no | SYSLINUX source repo + tag; enables the `syslinux` stage |
+| `TFA_REPO` / `TFA_TAG` / `TFA_PLAT` | no | ARM Trusted Firmware-A (BL31) repo, tag (default `master`), platform |
+| `RKBIN_REPO` / `RKBIN_TAG` / `RKBIN_DDR` | no | Rockchip blob repo, tag (default `master`), DDR-init blob glob |
+| `FIP_REPO` / `FIP_TAG` | no | Amlogic boot-FIP packaging repo, tag (default `master`) |
+| `FIRMWARE_TAG` | no | Tag for the firmware overlay repo (default: `TAG`) |
 | `COMPRESSION` | no | Image compression: `xz` (default), `gz`, `none` |
+| `TESTING` | no | Mark board as testing (`true`/`false`) |
 
 ## Limitations
 

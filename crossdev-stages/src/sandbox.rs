@@ -5,9 +5,9 @@ use camino::{Utf8Path, Utf8PathBuf};
 use portage_atom::Version as PortageVersion;
 
 use crate::board::BoardConfig;
-use crate::container::{destroy_dir, unpack_tarball, SandboxRunner};
+use crate::container::{destroy_dir, recover_mounts_for_removal, unpack_tarball, SandboxRunner};
 use crate::error::{Error, Result};
-use crate::portage::{install_host_deps, MakeConf};
+use crate::portage::{install_host_deps, sync_portage_tree, MakeConf};
 use crate::stage::gentoo_profile;
 use crate::workspace::Workspace;
 
@@ -45,10 +45,16 @@ impl Sandbox {
     }
 
     /// Configure portage and install host build dependencies.
-    /// Idempotent: skips if `.prepared` marker exists.
-    pub fn prepare(&self, mirror: Option<&str>) -> Result<()> {
+    /// Idempotent: skips if `.prepared` marker exists (or `.prepared-bare` when `bare`).
+    ///
+    /// With `bare`, writes `make.conf` and syncs the portage tree but does not emerge packages.
+    pub fn prepare(&self, mirror: Option<&str>, bare: bool) -> Result<()> {
         if self.dir.join(".prepared").exists() {
             tracing::info!("Sandbox already prepared, skipping.");
+            return Ok(());
+        }
+        if bare && self.dir.join(".prepared-bare").exists() {
+            tracing::info!("Sandbox already bare-prepared, skipping.");
             return Ok(());
         }
         tracing::info!("Configuring portage…");
@@ -61,11 +67,17 @@ impl Sandbox {
         }
         .write(&self.dir.join("etc/portage"))?;
 
-        tracing::info!("Installing host dependencies…");
-        install_host_deps(&self.runner())?;
-
-        std::fs::write(self.dir.join(".prepared"), "")?;
-        tracing::info!("Sandbox prepared.");
+        if bare {
+            sync_portage_tree(&self.runner())?;
+            std::fs::write(self.dir.join(".prepared-bare"), "")?;
+            tracing::info!("Sandbox bare-prepared.");
+        } else {
+            tracing::info!("Installing host dependencies…");
+            install_host_deps(&self.runner())?;
+            std::fs::write(self.dir.join(".prepared"), "")?;
+            let _ = std::fs::remove_file(self.dir.join(".prepared-bare"));
+            tracing::info!("Sandbox prepared.");
+        }
         Ok(())
     }
 
@@ -146,9 +158,8 @@ impl Sandbox {
                 })?;
                 let slot = ver.numbers[0].to_string();
                 // A single bare number ("15") means slot-only; anything longer is a prefix.
-                let is_slot_only = ver.numbers.len() == 1
-                    && ver.letter.is_none()
-                    && ver.suffixes.is_empty();
+                let is_slot_only =
+                    ver.numbers.len() == 1 && ver.letter.is_none() && ver.suffixes.is_empty();
                 if is_slot_only {
                     (slot, None)
                 } else {
@@ -183,6 +194,9 @@ impl Sandbox {
                     tracing::info!(
                         "Crossdev for {target_arch} already set up with gcc-{existing}, skipping."
                     );
+                    // Ensure any board-required ex-pkgs are present even if we skip a full re-run.
+                    let chost = crate::stage::chost_for_arch(target_arch)?;
+                    self.ensure_grub_ex_pkg(board, &chost, &runner)?;
                     return Ok(());
                 }
                 let want = ver_prefix.as_deref().unwrap_or(&gcc_slot);
@@ -193,7 +207,7 @@ impl Sandbox {
             }
         }
 
-        let chost = format!("{target_arch}-unknown-linux-gnu");
+        let chost = crate::stage::chost_for_arch(target_arch)?;
         let profile = gentoo_profile(target_arch)?;
         let cflags = board.effective_cflags();
 
@@ -230,7 +244,8 @@ impl Sandbox {
         let slot_versions = installed.get(&gcc_slot).cloned().unwrap_or_default();
 
         let gcc_ver = if let Some(ref prefix) = ver_prefix {
-            slot_versions.into_iter()
+            slot_versions
+                .into_iter()
                 .find(|v| v.starts_with(prefix.as_str()))
                 .ok_or_else(|| Error::CommandFailed {
                     code: 1,
@@ -238,17 +253,23 @@ impl Sandbox {
                 })?
         } else {
             // Slot-only: newest installed version (refresh gives newest-first).
-            slot_versions.into_iter().next().ok_or_else(|| Error::CommandFailed {
-                code: 1,
-                reason: format!("No gcc:{gcc_slot} found in sandbox after emerge"),
-            })?
+            slot_versions
+                .into_iter()
+                .next()
+                .ok_or_else(|| Error::CommandFailed {
+                    code: 1,
+                    reason: format!("No gcc:{gcc_slot} found in sandbox after emerge"),
+                })?
         };
 
         tracing::info!("Using gcc-{gcc_ver} for crossdev.");
 
         // gcc-config profile names are "{chost}-{slot}" (e.g. "aarch64-unknown-linux-gnu-15"),
         // not "{chost}-{full-version}". Select by slot directly.
-        let host_chost = runner.run_output("portageq envvar CHOST")?.trim().to_string();
+        let host_chost = runner
+            .run_output("portageq envvar CHOST")?
+            .trim()
+            .to_string();
         runner.run(&format!("gcc-config {host_chost}-{gcc_slot}"))?;
         runner.run("env-update && source /etc/profile")?;
 
@@ -272,15 +293,22 @@ impl Sandbox {
         runner.run(&format!("merge-usr --root /usr/{chost}"))?;
 
         tracing::info!("Running crossdev (this takes a while)…");
+        let grub_ex_pkg = if board.grub_platforms.is_some() {
+            " --ex-pkg sys-boot/grub"
+        } else {
+            ""
+        };
         runner.run(&format!(
             "crossdev {chost} \
              --gcc {gcc_ver} \
              --ex-pkg sys-devel/clang-crossdev-wrappers \
-             --ex-pkg sys-devel/rust-std"
+             --ex-pkg sys-devel/rust-std{grub_ex_pkg}"
         ))?;
 
         // Switch cross compiler to the installed slot.
-        runner.run(&format!("gcc-config {chost}-{gcc_slot} && source /etc/profile"))?;
+        runner.run(&format!(
+            "gcc-config {chost}-{gcc_slot} && source /etc/profile"
+        ))?;
 
         // Write marker with the exact version used (enables idempotency on next run).
         std::fs::write(&marker, &gcc_ver)?;
@@ -313,6 +341,42 @@ impl Sandbox {
     }
 
     // ── Private helpers ──────────────────────────────────────────────────────
+
+    /// Install `sys-boot/grub` into the crossdev prefix if the board needs it and it
+    /// isn't already there.  Uses `{chost}-emerge` (installs into `/usr/{chost}/`),
+    /// which compiles grub with the i586/x86 cross-compiler, producing proper
+    /// i386-pc modules regardless of the build host's native architecture.
+    fn ensure_grub_ex_pkg(
+        &self,
+        board: &BoardConfig,
+        chost: &str,
+        runner: &SandboxRunner,
+    ) -> Result<()> {
+        let Some(ref platforms) = board.grub_platforms else {
+            return Ok(());
+        };
+        let grub_mods = self
+            .dir
+            .join(format!("usr/{chost}/usr/lib/grub/i386-pc"));
+        if grub_mods.exists() {
+            return Ok(());
+        }
+        // Write USE flags to the crossdev prefix portage config before emerging.
+        // The crossdev portage config is not re-written when setup_crossdev is skipped,
+        // so we must ensure the grub platform flag is present here.
+        let flags: Vec<String> = platforms
+            .split_whitespace()
+            .map(|p| format!("grub_platforms_{p}"))
+            .collect();
+        let use_dir = self.dir.join(format!("usr/{chost}/etc/portage/package.use"));
+        std::fs::create_dir_all(&use_dir)?;
+        std::fs::write(
+            use_dir.join("grub"),
+            format!("sys-boot/grub {}\n", flags.join(" ")),
+        )?;
+        tracing::info!("Installing sys-boot/grub into crossdev prefix for {chost}…");
+        runner.run(&format!("{chost}-emerge -b -k sys-boot/grub"))
+    }
 
     /// Write portage config files for the crossdev prefix directly on the host fs.
     fn write_crossdev_portage(
@@ -372,10 +436,21 @@ impl Sandbox {
         )?;
         std::fs::write(portage_dir.join("package.use/git"), "dev-vcs/git -iconv\n")?;
 
+        if let Some(ref platforms) = board.grub_platforms {
+            let flags: Vec<String> = platforms
+                .split_whitespace()
+                .map(|p| format!("grub_platforms_{p}"))
+                .collect();
+            std::fs::write(
+                portage_dir.join("package.use/grub"),
+                format!("sys-boot/grub {}\n", flags.join(" ")),
+            )?;
+        }
+
         // package.accept_keywords
         std::fs::write(
             portage_dir.join("package.accept_keywords/gcc"),
-            &format!("{gcc_keyword_line}\n"),
+            format!("{gcc_keyword_line}\n"),
         )?;
 
         // Per-package CFLAGS workarounds from board.conf
@@ -406,6 +481,7 @@ pub fn destroy(ws: &Workspace, name: &str) -> Result<()> {
         return Err(crate::error::Error::SandboxNotFound(name.into()));
     }
     println!("Removing sandbox: {name}");
+    recover_mounts_for_removal(&dir, false)?;
     destroy_dir(&dir, ws.base())?;
     println!("Sandbox '{name}' removed.");
     Ok(())
@@ -419,11 +495,13 @@ pub fn list(ws: &Workspace) -> Result<Vec<SandboxInfo>> {
         .map(|dir| {
             let arch = crate::workspace::read_arch(&dir).unwrap_or_else(|| "unknown".into());
             let prepared = dir.join(".prepared").exists();
+            let bare_prepared = dir.join(".prepared-bare").exists();
             let name = dir.file_name().unwrap_or("").to_string();
             SandboxInfo {
                 name,
                 arch,
                 prepared,
+                bare_prepared,
             }
         })
         .collect())
@@ -433,4 +511,5 @@ pub struct SandboxInfo {
     pub name: String,
     pub arch: String,
     pub prepared: bool,
+    pub bare_prepared: bool,
 }
