@@ -1,0 +1,7 @@
+# rust-std cross-compilation is disabled for this board (see BOARD_RUSTFLAGS
+# in board.conf / sandbox.rs setup_crossdev): dev-lang/rust from source needs
+# ~9.6GB of tmpfs to bootstrap, which a RAM-constrained build host may not
+# have. dev-vcs/git's "rust" USE flag is on by default and builds a Rust
+# component ("gitcore") that needs the armv7a rust-std target, so it fails
+# with "can't find crate for `std`" unless explicitly disabled here.
+dev-vcs/git -rust
