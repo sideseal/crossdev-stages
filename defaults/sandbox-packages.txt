@@ -27,6 +27,9 @@ sys-fs/genimage
 sys-fs/dosfstools
 sys-fs/mtools
 
-# Languages used during build
-dev-lang/rust
+# Languages used during build. -bin: this is host tooling with no CFLAGS/USE
+# tuning need, and dev-lang/rust from source needs ~9.6GB of tmpfs space at
+# build time (dev-lang/rust's own check-reqs floor) that a RAM-constrained
+# build host may not have.
+dev-lang/rust-bin
 dev-python/pyelftools
