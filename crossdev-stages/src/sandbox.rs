@@ -52,15 +52,16 @@ impl Sandbox {
     /// With `bare`, writes `make.conf` and syncs the portage tree but does not
     /// emerge packages.  When `<defaults_root>/overlay.conf` names one,
     /// installs the `crossdev-stages` portage overlay (apk-tools, dnf5, the
-    /// opt-in ESOS firmware ebuilds).
+    /// opt-in ESOS firmware ebuilds) -- only in the non-bare path, since the
+    /// overlay is fetched with `git`, and a bare sandbox never emerges one.
     pub fn prepare(&self, mirror: Option<&str>, defaults_root: &Utf8Path, bare: bool) -> Result<()> {
-        // The overlay refreshes on every prepare, even on an already-prepared
-        // sandbox: the pinned overlay repo is the source of truth and the
-        // checkout is cheap and idempotent.
-        install_overlay(self.runner(), &self.dir, defaults_root)?;
-
         if self.dir.join(".prepared").exists() {
             tracing::info!("Sandbox already prepared, skipping.");
+            // Refreshes even on an already-prepared sandbox: the pinned
+            // overlay repo is the source of truth and the checkout is cheap
+            // and idempotent. Safe here specifically because a sandbox that
+            // reached `.prepared` already has git from a previous prepare.
+            install_overlay(self.runner(), &self.dir, defaults_root)?;
             return Ok(());
         }
         if bare && self.dir.join(".prepared-bare").exists() {
@@ -89,6 +90,10 @@ impl Sandbox {
         } else {
             tracing::info!("Installing host dependencies…");
             install_host_deps(&self.runner(), defaults_root, &self.dir.join("etc/portage"))?;
+            // Only now does the sandbox have git: a fresh stage3 doesn't
+            // carry one, so cloning the overlay any earlier fails on every
+            // first-time prepare with "git: command not found".
+            install_overlay(self.runner(), &self.dir, defaults_root)?;
             std::fs::write(self.dir.join(".prepared"), "")?;
             let _ = std::fs::remove_file(self.dir.join(".prepared-bare"));
             tracing::info!("Sandbox prepared.");
@@ -370,9 +375,23 @@ impl Sandbox {
         )?;
 
         // Pin gcc + llvm in the cross prefix so future emerges (e.g.
-        // `target update`'s cross_emerge_crossdev sys-devel/gcc) don't
-        // silently jump to a different major.
-        let gcc_pin = ver_prefix.as_deref().or(board.gcc_version.as_deref());
+        // `target update`'s cross_emerge_crossdev sys-devel/gcc, or
+        // packages.build's plain sys-devel/gcc atom during `target stage1`)
+        // don't silently jump to a different major. Falling all the way
+        // through to no pin when neither an explicit version nor a board
+        // pin was given left the prefix wide open: packages.build's
+        // unversioned atom then resolves to whatever is newest in the tree,
+        // which cross-compiles using *this* gcc (gcc_slot) as the compiler
+        // -- and a newer major's own build system can pass flags (e.g.
+        // libatomic's -fno-link-libatomic) this compiler doesn't know,
+        // failing with "C compiler cannot create executables" deep in a
+        // configure check that never mentions gcc at all. Default to the
+        // slot actually resolved above, so the fallback always matches
+        // what crossdev just built.
+        let gcc_pin = ver_prefix
+            .as_deref()
+            .or(board.gcc_version.as_deref())
+            .or(Some(gcc_slot.as_str()));
         crate::portage::write_version_pins(&crossdev_portage, gcc_pin)?;
 
         // Fix the split-usr layout created by crossdev.
@@ -391,7 +410,13 @@ impl Sandbox {
 
         tracing::info!("Running crossdev (this takes a while)…");
         // rustc has no upstream target for riscv32-unknown-linux-gnu; skip rust-std on rv32.
-        let rust_std_ex_pkg = if target_arch == "riscv32" {
+        // Otherwise only pulled in for boards that set BOARD_RUSTFLAGS (the
+        // one thing rust-std is for here, per BoardConfig::rustflags) --
+        // cross rust-std needs dev-lang/rust from source as its bootstrap
+        // (dev-lang/rust-bin can't stand in, unlike for host tooling), which
+        // needs ~9.6GB of tmpfs at build time. Not worth forcing on every
+        // board when most never touch Rust.
+        let rust_std_ex_pkg = if target_arch == "riscv32" || board.rustflags.is_none() {
             ""
         } else {
             " --ex-pkg sys-devel/rust-std"
@@ -401,10 +426,17 @@ impl Sandbox {
         // paths and collide with the sandbox's own sys-boot/grub.  It goes in
         // through ensure_grub_ex_pkg below, which cross-emerges it into
         // /usr/<chost>/usr/bin/ with no host overlap.
+        //
+        // clang-crossdev-wrappers is NOT requested here: nothing in this
+        // codebase reads it, and every version's RDEPEND on its own
+        // llvm-core/clang:${PV} slot conflicts with the LLVM_SLOT pin except
+        // the one matching version, which is a live ebuild with no KEYWORDS
+        // at all -- so getting it installed at all means compiling the
+        // entire pinned LLVM_SLOT's clang+lld from source, purely for a
+        // symlink package nothing here depends on.
         runner.run(&format!(
             "crossdev {chost} \
-             --gcc {gcc_ver} \
-             --ex-pkg sys-devel/clang-crossdev-wrappers{rust_std_ex_pkg}"
+             --gcc {gcc_ver}{rust_std_ex_pkg}"
         ))?;
 
         // Switch cross compiler to the installed slot.
