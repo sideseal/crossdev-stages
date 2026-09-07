@@ -155,6 +155,81 @@ The kernel side is baked into every image built from this board directory
 regardless of whether docker is ever installed, so this is a one-time
 post-boot step, not something that has to happen per rebuild.
 
+### Known gotchas (native on-device install)
+
+None of these are crossdev-stages bugs — they're environment/upstream quirks
+specific to running Portage natively on this board. Encountered and fixed
+2026-09-07/08 doing this exact install on real hardware:
+
+1. **`emerge-webrsync` 404s on every snapshot, walking back to 1999-dated
+   URLs.** The XU4 has no battery-backed RTC, so the clock resets to roughly
+   2000-01-01 on every cold boot, and Portage's snapshot-date-walking logic
+   can't find a snapshot in the future from where it thinks it is. Sync time
+   first, then persist it (`net-misc/ntp` is already in
+   `target-packages.txt`):
+
+   ```sh
+   ntpd -q -g -x
+   rc-update add ntpd default
+   rc-service ntpd start
+   ```
+
+2. **`dev-go/go-md2man` fails: `-buildmode=pie requires external (cgo)
+   linking, but cgo is not enabled`.** 32-bit ARM Go defaults to PIE, but
+   this ebuild's Makefile hardcodes `CGO_ENABLED=0` literally on the build
+   line, so neither `make.conf` nor `GOFLAGS` can override it — the inline
+   assignment always wins over an inherited env var. This is a known
+   unresolved upstream Gentoo/Go issue on 32-bit arm/x86:
+   [bug 924632](https://bugs.gentoo.org/924632). Patch the Makefile via a
+   global `/etc/portage/bashrc` hook instead of a patch file (Makefiles'
+   significant leading tabs make copy-pasted unified diffs fragile):
+
+   ```sh
+   cat >> /etc/portage/bashrc <<'EOF'
+   post_src_prepare() {
+       case "${CATEGORY}/${PN}" in
+           dev-go/go-md2man)
+               sed -i 's/CGO_ENABLED=0/CGO_ENABLED=1/' Makefile
+               ;;
+       esac
+   }
+   EOF
+   ```
+
+3. **`app-containers/containerd` fails during compile: `dial tcp: lookup
+   proxy.golang.org ...: network is unreachable`.** Unlike go-md2man, this
+   ebuild doesn't vendor its Go module deps in a `-deps.tar.xz`, so it needs
+   live network access to `go mod download`, which Portage's default
+   `FEATURES="network-sandbox"` blocks entirely. Disable it for just this
+   package:
+
+   ```sh
+   mkdir -p /etc/portage/env
+   echo 'FEATURES="${FEATURES} -network-sandbox"' > /etc/portage/env/allow-net
+   echo 'app-containers/containerd allow-net' >> /etc/portage/package.env
+   ```
+
+4. **`app-containers/containerd` still fails: same `-buildmode=pie ...cgo`
+   error, this time at `Makefile:275` building
+   `bin/containerd-shim-runc-v2`.** Looks identical to #2 but the cause is
+   different and simpler to fix: this Makefile gates it behind a
+   conditionally-assigned variable, `SHIM_CGO_ENABLED ?= 0`, not a hardcoded
+   literal. `?=` only assigns when the variable has no value yet, so an
+   inherited environment variable *does* win here — no `sed` needed, just
+   feed it through the same package.env file from #3:
+
+   ```sh
+   echo 'SHIM_CGO_ENABLED=1' >> /etc/portage/env/allow-net
+   ```
+
+   The moral for both #2 and #4: the identical symptom
+   (`-buildmode=pie requires external (cgo) linking`) can come from either a
+   hardcoded `CGO_ENABLED=0` (needs a Makefile patch) or a `?=`-defaulted one
+   (needs only an env var) — check which before reaching for `sed`.
+
+With all four applied, `emerge app-containers/docker` completes end to end
+on real XU4 hardware.
+
 ## WiFi (USB dongle)
 
 Tested against a Realtek RTL8188FU / RTL8188FTV ("802.11b/g/n 1T1R") USB
