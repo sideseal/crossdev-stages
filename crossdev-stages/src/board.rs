@@ -405,9 +405,19 @@ fn parse(name: &str, path: &Utf8Path, content: &str) -> Result<BoardConfig> {
             .map(|v| v.split_whitespace().map(str::to_string).collect())
             .unwrap_or_default(),
         kernel_defconfig: req!("KERNEL_DEFCONFIG"),
-        kernel_config_fragments: kv
+        // Board.conf documents this as bash-array syntax (see
+        // defaults/kernel-config/docker's header comment), which the loop
+        // above routes into `arrays`, not `kv` -- a plain `kv.get` here
+        // always missed it and silently produced an empty fragment list.
+        // Keep the whitespace-separated scalar form working too, in case a
+        // board.conf ever writes it unquoted without parens.
+        kernel_config_fragments: arrays
             .get("KERNEL_CONFIG_FRAGMENTS")
-            .map(|v| v.split_whitespace().map(str::to_string).collect())
+            .cloned()
+            .or_else(|| {
+                kv.get("KERNEL_CONFIG_FRAGMENTS")
+                    .map(|v| v.split_whitespace().map(str::to_string).collect())
+            })
             .unwrap_or_default(),
         kernel_dtb_glob: kv.get("BOARD_DTB_GLOB").cloned(),
 
@@ -537,4 +547,53 @@ fn parse_array(inner: &str) -> Vec<String> {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MINIMAL: &str = r#"
+BOARD_ARCH="arm"
+CROSS_COMPILE="armv7a-unknown-linux-gnueabihf-"
+KERNEL_REPO="https://example.invalid/linux.git"
+KERNEL_DEFCONFIG="exynos_defconfig"
+"#;
+
+    // Regression test for the bug where board.conf's documented bash-array
+    // syntax for KERNEL_CONFIG_FRAGMENTS (see
+    // defaults/kernel-config/docker's header comment: `KERNEL_CONFIG_FRAGMENTS=("docker")`)
+    // was parsed into the `arrays` map but read back via `kv.get`, so every
+    // board using that syntax silently got an empty fragment list -- kernel
+    // features documented as "baked in" (docker's netfilter/bridge/USER_NS,
+    // the RTL8188FU wifi driver) were never actually merged into any build.
+    #[test]
+    fn kernel_config_fragments_array_syntax_is_read() {
+        let content = format!(
+            "{MINIMAL}\nKERNEL_CONFIG_FRAGMENTS=(\"docker\" \"wifi-rtl8188fu\")\n"
+        );
+        let board = parse("test-board", Utf8Path::new("board.conf"), &content).unwrap();
+        assert_eq!(
+            board.kernel_config_fragments,
+            vec!["docker".to_string(), "wifi-rtl8188fu".to_string()]
+        );
+    }
+
+    // The plain whitespace-separated scalar form (no parens) must keep
+    // working too, in case a board.conf ever writes it that way.
+    #[test]
+    fn kernel_config_fragments_scalar_syntax_is_read() {
+        let content = format!("{MINIMAL}\nKERNEL_CONFIG_FRAGMENTS=\"docker wifi-rtl8188fu\"\n");
+        let board = parse("test-board", Utf8Path::new("board.conf"), &content).unwrap();
+        assert_eq!(
+            board.kernel_config_fragments,
+            vec!["docker".to_string(), "wifi-rtl8188fu".to_string()]
+        );
+    }
+
+    #[test]
+    fn kernel_config_fragments_defaults_to_empty() {
+        let board = parse("test-board", Utf8Path::new("board.conf"), MINIMAL).unwrap();
+        assert!(board.kernel_config_fragments.is_empty());
+    }
 }
