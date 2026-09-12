@@ -375,9 +375,23 @@ impl Sandbox {
         )?;
 
         // Pin gcc + llvm in the cross prefix so future emerges (e.g.
-        // `target update`'s cross_emerge_crossdev sys-devel/gcc) don't
-        // silently jump to a different major.
-        let gcc_pin = ver_prefix.as_deref().or(board.gcc_version.as_deref());
+        // `target update`'s cross_emerge_crossdev sys-devel/gcc, or
+        // packages.build's plain sys-devel/gcc atom during `target stage1`)
+        // don't silently jump to a different major. Falling all the way
+        // through to no pin when neither an explicit version nor a board
+        // pin was given left the prefix wide open: packages.build's
+        // unversioned atom then resolves to whatever is newest in the tree,
+        // which cross-compiles using *this* gcc (gcc_slot) as the compiler
+        // -- and a newer major's own build system can pass flags (e.g.
+        // libatomic's -fno-link-libatomic) this compiler doesn't know,
+        // failing with "C compiler cannot create executables" deep in a
+        // configure check that never mentions gcc at all. Default to the
+        // slot actually resolved above, so the fallback always matches
+        // what crossdev just built.
+        let gcc_pin = ver_prefix
+            .as_deref()
+            .or(board.gcc_version.as_deref())
+            .or(Some(gcc_slot.as_str()));
         crate::portage::write_version_pins(&crossdev_portage, gcc_pin)?;
 
         // Fix the split-usr layout created by crossdev.
