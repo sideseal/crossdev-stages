@@ -38,3 +38,31 @@ cat >> /build/gen/root/etc/fstab <<FSTAB
 PARTUUID=${BOOT_DISK_ID}-02  /      ext4  defaults,noatime  0 1
 PARTUUID=${BOOT_DISK_ID}-01  /boot  ext4  defaults,noatime  0 2
 FSTAB
+
+# `emerge app-containers/docker` gotchas, found the hard way installing it on
+# real hardware (see README's "Known gotchas" under Docker). CGO_ENABLED=1
+# for the whole target lives in make.conf (auto-appended, see this board's
+# make.conf); the two packages below hardcode CGO_ENABLED=0 in their own
+# Makefile, which a mere env var can't override, so patch it out via a
+# global bashrc hook instead of a fragile unified-diff patch file.
+cat >> /build/gen/root/etc/portage/bashrc <<'EOF'
+post_src_prepare() {
+	case "${CATEGORY}/${PN}" in
+		dev-go/go-md2man|app-containers/containerd)
+			sed -i 's/CGO_ENABLED=0/CGO_ENABLED=1/' Makefile
+			;;
+	esac
+}
+EOF
+
+# containerd's own build needs live network for `go mod download` (it does
+# not vendor a deps tarball the way go-md2man does), which Portage's default
+# FEATURES="network-sandbox" blocks outright.  SHIM_CGO_ENABLED is a `?=`
+# variable, not a hardcoded one, so it takes an env var straight -- no sed
+# needed for that half of the same PIE/cgo problem.
+mkdir -p /build/gen/root/etc/portage/env
+cat > /build/gen/root/etc/portage/env/allow-net <<'EOF'
+FEATURES="${FEATURES} -network-sandbox"
+SHIM_CGO_ENABLED=1
+EOF
+echo 'app-containers/containerd allow-net' >> /build/gen/root/etc/portage/package.env
